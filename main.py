@@ -1,33 +1,39 @@
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from agent_core import run_agent
-from typing import List # 新增
+from typing import List
+from agent_core import run_agent_stream
 
-app = FastAPI(title="天软差旅合规 Agent (DeepSeek版)")
+app = FastAPI(title="天软差旅合规 Agent")
 
-# 定义历史消息的格式
+# 开启跨域，防止以后前端分离时报错
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 class Message(BaseModel):
-    role: str   # 只能是 "user" 或 "assistant"
+    role: str
     content: str
 
-# 更新请求体，包含当前问题和历史记录
 class QueryRequest(BaseModel):
     text: str
-    history: List[Message] = []  # 默认为空列表
+    history: List[Message] = []
 
 @app.get("/", response_class=HTMLResponse)
 async def get_index():
     with open("index.html", "r", encoding="utf-8") as f:
         return f.read()
 
-@app.post("/chat")
-async def chat(request: QueryRequest):
-    # 把前端传过来的历史记录转换一下格式，传给 Agent
-    history_list = []
-    for msg in request.history:
-        history_list.append((msg.role, msg.content))
+@app.post("/chat/stream")
+async def chat_stream(request: QueryRequest):
+    # 转换历史格式
+    history_list = [(msg.role, msg.content) for msg in request.history]
     
-    # 调用 Agent 时，把历史记录也传进去
-    reply = run_agent(request.text, history_list)
-    return {"reply": reply}
+    return StreamingResponse(
+        run_agent_stream(request.text, history_list), 
+        media_type="text/event-stream"
+    )
