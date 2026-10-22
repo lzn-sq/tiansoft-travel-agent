@@ -3,42 +3,53 @@ import os
 from langchain_core.tools import tool
 from langchain_community.document_loaders import TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain_openai import OpenAIEmbeddings
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# 1. 初始化本地知识库（简化版 RAG，确保稳定不报错）
-def init_knowledge_base():
-    if not os.path.exists("policy.txt"):
-        return "未找到 policy.txt 知识库文件。"
+# 初始化 ChromaDB
+def get_vectorstore():
+    # 如果没有，用智谱的 Embedding (需要你在 .env 里加 ZHIPU_API_KEY)
+    # 如果你没有智谱Key，这里会报错。请在 bigmodel.cn 注册一个免费拿Key
+    embeddings = OpenAIEmbeddings(
+        model="embedding-2",
+        api_key=os.getenv("ZHIPU_API_KEY"),
+        base_url="https://open.bigmodel.cn/api/paas/v4/"
+    )
+    
+    persist_dir = "./chroma_db"
+    # 如果本地已经有数据库了，直接加载
+    if os.path.exists(persist_dir):
+        return Chroma(persist_directory=persist_dir, embedding_function=embeddings)
+    
+    # 如果没有，读取文件并建库
     loader = TextLoader("policy.txt", encoding="utf-8")
     docs = loader.load()
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=20)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)
     splits = text_splitter.split_documents(docs)
-    return splits
+    
+    vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings, persist_directory=persist_dir)
+    return vectorstore
 
-policy_splits = init_knowledge_base()
+vectorstore = get_vectorstore()
+retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
 
 @tool
 def calculator(expression: str) -> str:
-    """用于计算差旅金额总和。当需要计算总和、平均值或进行数学运算时使用。
-    输入必须是合法的数学表达式字符串，例如 '550+800+120'。千万不要包含文字。"""
+    """用于计算金额总和。输入必须是纯数字表达式，如 '550+800'。"""
     try:
-        # 用正则清洗，防止模型传入奇怪的中文字符
         clean_expr = re.sub(r'[^0-9+\-*/().]', '', expression)
-        if not clean_expr:
-            return "提取不到有效的数字表达式，请重新输入。"
-        result = eval(clean_expr, {"__builtins__": None}, {})
-        return f"计算结果：{result} 元"
+        return f"计算结果：{eval(clean_expr, {'__builtins__': None}, {})} 元"
     except Exception as e:
-        return f"计算失败，请输入合法的数学表达式。错误信息：{str(e)}"
+        return f"计算失败：{str(e)}"
 
 @tool
 def search_policy(query: str) -> str:
-    """查询天软公司差旅报销标准。当需要确认住宿、交通、餐饮是否合规时使用。
-    输入你查询的类别，如：'住宿'、'交通'、'一线城市标准'。"""
-    # 模拟检索过程，将所有政策条款返回给大模型参考
-    if isinstance(policy_splits, str):
-        return policy_splits
-    relevant_docs = [doc.page_content for doc in policy_splits]
-    return "\n".join(relevant_docs)
+    """从向量数据库中查询公司差旅制度。输入你要查询的类别，如：'住宿标准'、'打车限制'。"""
+    # 真正的 RAG 检索！只返回最相关的 2 个文档片段
+    docs = retriever.invoke(query)
+    if not docs:
+        return "未找到相关制度。"
+    return "\n---\n".join([d.page_content for d in docs])
