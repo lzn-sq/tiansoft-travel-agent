@@ -22,7 +22,6 @@ model = ChatOpenAI(
 # ================= 1. 定义状态结构 =================
 class AgentState(TypedDict):
     messages: Annotated[List, operator.add]
-    next_action: str  # 决定路由去哪个节点
 
 # ================= 2. 定义 Agent 节点 =================
 # 审批 Agent（带工具）
@@ -38,40 +37,46 @@ async def approval_node(state: AgentState):
     
     result = await approval_executor.ainvoke({"messages": [system_msg] + state["messages"]})
     last_message = result["messages"][-1].content
-    
-    # 决定下一步动作
-    next_action = "payment" if "审批通过" in last_message and "不予报销" not in last_message else "end"
-    return {"messages": [AIMessage(content=last_message)], "next_action": next_action}
+    return {"messages": [AIMessage(content=last_message)]}
 
 async def payment_node(state: AgentState):
     """打款节点：负责生成打款单"""
     pay_id = f"PAY-{uuid.uuid4().hex[:6].upper()}"
     payment_res = f"\n\n💸 **[财务打款 Agent 接管]**\n审批已通过，正在处理打款流程。\n打款单号：{pay_id}\n预计 1 个工作日内到账。"
-    return {"messages": [AIMessage(content=payment_res)], "next_action": "end"}
+    return {"messages": [AIMessage(content=payment_res)]}
 
 # ================= 3. 组装状态图 =================
-workflow = StateGraph(AgentState)
+# 审核 Agent：只做合规审核，不涉及打款
+review_workflow = StateGraph(AgentState)
+review_workflow.add_node("approval", approval_node)
+review_workflow.set_entry_point("approval")
+review_workflow.add_edge("approval", END)
+review_agent = review_workflow.compile()
 
-# 添加节点
-workflow.add_node("approval", approval_node)
-workflow.add_node("payment", payment_node)
+# 打款 Agent：只负责生成打款单，由调度逻辑单独调用
+payment_workflow = StateGraph(AgentState)
+payment_workflow.add_node("payment", payment_node)
+payment_workflow.set_entry_point("payment")
+payment_workflow.add_edge("payment", END)
+payment_agent = payment_workflow.compile()
 
-# 设置入口
-workflow.set_entry_point("approval")
+# ================= 4. 判断用户是否要求发起打款 =================
+async def wants_payment(query: str) -> bool:
+    """区分“审核是否合规”和“要求报销/打款”，避免审核时误触发打款 Agent"""
+    try:
+        result = await model.ainvoke([
+            SystemMessage(content="""判断用户是否在要求执行报销/打款操作。
+    只是咨询制度、询问标准、要求审核是否合规、询问能否报销时，回答 REVIEW。
+    明确要求“帮我报销”“发起打款”“提交报销”“走打款流程”时，回答 PAY。
+    只回答 REVIEW 或 PAY，不要输出其他内容。"""),
+            HumanMessage(content=query),
+        ])
+        return "PAY" in result.content.upper() and "REVIEW" not in result.content.upper()
+    except Exception:
+        # 判定失败时默认只审核，不误触发打款
+        return False
 
-# 设置条件路由边
-def route_decision(state: AgentState):
-    if state["next_action"] == "payment":
-        return "payment"
-    return END
-
-workflow.add_conditional_edges("approval", route_decision, {"payment": "payment", END: END})
-workflow.add_edge("payment", END)
-
-# 编译图
-multi_agent_graph = workflow.compile()
-
-# ================= 4. 对外暴露的流式接口 =================
+# ================= 5. 对外暴露的流式接口 =================
 async def run_agent_stream(query: str, history: list):
     # 将历史记录转为 LangChain 消息格式
     langchain_history = []
@@ -82,16 +87,26 @@ async def run_agent_stream(query: str, history: list):
             langchain_history.append(AIMessage(content=content))
             
     langchain_history.append(HumanMessage(content=query))
+    state = {"messages": langchain_history}
     
-    # 使用 astream_events 精细控制流
-    async for event in multi_agent_graph.astream_events({"messages": langchain_history, "next_action": ""}, version="v2"):
+    # 1) 先调用审核 Agent
+    review_text = ""
+    async for event in review_agent.astream_events(state, version="v2"):
         if event["event"] == "on_chat_model_stream":
             content = event["data"]["chunk"].content
             if content and "Thought:" not in content and "Action:" not in content:
+                review_text += content
                 yield f"data: {content}\n\n"
-        elif event["event"] == "on_chain_end" and event.get("name") == "payment":
-            # 打款节点不经过大模型，不会触发 on_chat_model_stream，需要单独把结果推给前端
-            output = event["data"].get("output") or {}
-            for message in output.get("messages", []):
-                if isinstance(message.content, str) and message.content:
-                    yield f"data: {message.content}\n\n"
+    
+    # 2) 只有用户明确要求打款，且审核通过时，才调用打款 Agent
+    approved = "审批通过" in review_text and "不予报销" not in review_text
+    if approved and await wants_payment(query):
+        async for event in payment_agent.astream_events(state, version="v2"):
+            if event["event"] == "on_chain_end" and event.get("name") == "payment":
+                output = event["data"].get("output") or {}
+                for message in output.get("messages", []):
+                    content = message.content if isinstance(message.content, str) else ""
+                    # 去掉首尾换行，避免内容里的 "\n\n" 被前端当成 SSE 事件分隔符而丢弃
+                    content = content.strip()
+                    if content:
+                        yield f"data: {content}\n\n"
