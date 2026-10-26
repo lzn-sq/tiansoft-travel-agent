@@ -3,3 +3,4 @@ __pycache__/
 chroma_db/
 node_modules/
 dist/
+agent.db

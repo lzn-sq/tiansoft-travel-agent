@@ -89,3 +89,9 @@ async def run_agent_stream(query: str, history: list):
             content = event["data"]["chunk"].content
             if content and "Thought:" not in content and "Action:" not in content:
                 yield f"data: {content}\n\n"
+        elif event["event"] == "on_chain_end" and event.get("name") == "payment":
+            # 打款节点不经过大模型，不会触发 on_chat_model_stream，需要单独把结果推给前端
+            output = event["data"].get("output") or {}
+            for message in output.get("messages", []):
+                if isinstance(message.content, str) and message.content:
+                    yield f"data: {message.content}\n\n"

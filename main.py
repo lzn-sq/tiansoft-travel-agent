@@ -45,15 +45,20 @@ async def chat_stream(request: ChatRequest, db: AsyncSession = Depends(get_db)):
     # 3. 定义一个生成器，包裹流式输出，并在流结束后保存 AI 回复
     async def event_generator():
         full_ai_reply = ""
-        async for chunk in run_agent_stream(user_text, history):
-            # 提取实际内容（去掉 data: 前缀）用于存库
-            content = chunk.replace("data: ", "").strip()
-            if content:
-                full_ai_reply += content
-            yield chunk
-            
-        # 流结束后，保存 AI 完整的回复
-        if full_ai_reply:
-            await crud.add_message(db, session_id, "assistant", full_ai_reply)
+        try:
+            async for chunk in run_agent_stream(user_text, history):
+                # 提取实际内容（去掉 data: 前缀和结尾换行）用于存库
+                content = chunk[len("data: "):].rstrip("\n") if chunk.startswith("data: ") else chunk
+                if content:
+                    full_ai_reply += content
+                yield chunk
+        except Exception as e:
+            # 把异常透传给前端，避免前端永远停在“正在规划任务”
+            success = False
+            yield f"data: ⚠️ 后端处理异常：{type(e).__name__}: {e}\n\n"
+        else:
+            # 流结束后，保存 AI 完整的回复
+            if full_ai_reply:
+                await crud.add_message(db, session_id, "assistant", full_ai_reply)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")

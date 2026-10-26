@@ -27,6 +27,17 @@ export default function Chat() {
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, loading]);
 
+  // 统一更新指定助手消息的内容
+  const updateAssistant = (index, content) => {
+    setMessages(prev => {
+      const updated = [...prev];
+      if (updated[index]) {
+        updated[index] = { role: 'assistant', content };
+      }
+      return updated;
+    });
+  };
+
   const sendMessage = async () => {
     const text = inputText.trim();
     if (!text || loading || !sessionId) return;
@@ -45,6 +56,10 @@ export default function Chat() {
         body: JSON.stringify({ session_id: sessionId, text: text })
       });
 
+      if (!response.ok) {
+        throw new Error(`后端返回状态码 ${response.status}`);
+      }
+
       const reader = response.body.getReader();
       const decoder = new TextDecoder('utf-8');
       let fullReply = '';
@@ -61,17 +76,16 @@ export default function Chat() {
         for (const part of parts) {
           if (part.startsWith('data: ')) {
             fullReply += part.replace('data: ', '');
-            setMessages(prev => {
-              const updated = [...prev];
-              if (updated[aiMsgIndex]) {
-                updated[aiMsgIndex] = { role: 'assistant', content: fullReply };
-              }
-              return updated;
-            });
+            updateAssistant(aiMsgIndex, fullReply);
           }
         }
       }
+
+      if (!fullReply.trim()) {
+        updateAssistant(aiMsgIndex, '⚠️ 后端没有返回任何内容，请检查后端终端日志（常见原因：API Key 失效、后端进程未重启或接口报错）。');
+      }
     } catch (e) {
+      updateAssistant(aiMsgIndex, `⚠️ 请求失败：${e.message}`);
       message.error("网络异常");
     } finally {
       setLoading(false);
