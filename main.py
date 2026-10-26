@@ -1,52 +1,59 @@
-from fastapi import FastAPI
+import uuid
+from fastapi import FastAPI, Depends
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
+from sqlalchemy.ext.asyncio import AsyncSession
+from database import engine, Base, get_db
+import models, crud
 from agent_core import run_agent_stream
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI
 
-app = FastAPI()
+app = FastAPI(title="天软企业级 Agent")
 
-# 允许前端跨域访问
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-app = FastAPI(title="天软差旅合规 Agent")
+# 启动时自动建表
+@app.on_event("startup")
+async def startup():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
-# 开启跨域，防止以后前端分离时报错
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class Message(BaseModel):
-    role: str
-    content: str
-
-class QueryRequest(BaseModel):
+class ChatRequest(BaseModel):
+    session_id: str
     text: str
-    history: List[Message] = []
 
-@app.get("/", response_class=HTMLResponse)
-async def get_index():
-    with open("index.html", "r", encoding="utf-8") as f:
-        return f.read()
+@app.get("/api/session")
+async def create_new_session(db: AsyncSession = Depends(get_db)):
+    """前端初始化时，请求分配一个唯一会话 ID"""
+    session_id = str(uuid.uuid4())
+    await crud.create_session(db, session_id)
+    return {"session_id": session_id}
 
-@app.post("/chat/stream")
-async def chat_stream(request: QueryRequest):
-    # 转换历史格式
-    history_list = [(msg.role, msg.content) for msg in request.history]
+@app.post("/api/chat/stream")
+async def chat_stream(request: ChatRequest, db: AsyncSession = Depends(get_db)):
+    session_id = request.session_id
+    user_text = request.text
     
-    return StreamingResponse(
-        run_agent_stream(request.text, history_list), 
-        media_type="text/event-stream"
-    )
+    # 1. 先从数据库获取历史记录
+    history = await crud.get_history(db, session_id)
+    
+    # 2. 保存用户的新消息入库
+    await crud.add_message(db, session_id, "user", user_text)
+    
+    # 3. 定义一个生成器，包裹流式输出，并在流结束后保存 AI 回复
+    async def event_generator():
+        full_ai_reply = ""
+        async for chunk in run_agent_stream(user_text, history):
+            # 提取实际内容（去掉 data: 前缀）用于存库
+            content = chunk.replace("data: ", "").strip()
+            if content:
+                full_ai_reply += content
+            yield chunk
+            
+        # 流结束后，保存 AI 完整的回复
+        if full_ai_reply:
+            await crud.add_message(db, session_id, "assistant", full_ai_reply)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")

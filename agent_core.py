@@ -1,13 +1,17 @@
 import os
-import re
 import uuid
+from typing import TypedDict, Annotated, List
+import operator
 from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import create_react_agent
 from tools import calculator, search_policy
 
 load_dotenv()
 
+# 初始化模型
 model = ChatOpenAI(
     model="deepseek-chat",
     api_key=os.getenv("DEEPSEEK_API_KEY"),
@@ -15,42 +19,73 @@ model = ChatOpenAI(
     temperature=0
 )
 
-tools = [calculator, search_policy]
-approval_agent = create_react_agent(model, tools)
+# ================= 1. 定义状态结构 =================
+class AgentState(TypedDict):
+    messages: Annotated[List, operator.add]
+    next_action: str  # 决定路由去哪个节点
 
-# 极度强制的 Prompt，如果不带“审批通过”四个字，就视为失败
-SYSTEM_PROMPT = """你是一个严格的天软公司财务审核员。
-【重要任务】：
-1. 必须先调用计算器算账，再查报销标准。
-2. **绝对不要输出思考过程**。
-3. 直接输出审核结果。
-4. **特别注意**：如果你的结论是合规的，你的回复最后**必须**原样包含“审批通过”这四个字。如果不合规，请说明原因。
-"""
+# ================= 2. 定义 Agent 节点 =================
+# 审批 Agent（带工具）
+approval_tools = [calculator, search_policy]
+approval_executor = create_react_agent(model, approval_tools)
 
-async def run_agent_stream(query: str, history: list = None):
-    if history is None:
-        history = []
+async def approval_node(state: AgentState):
+    """审批节点：负责查账与合规判定"""
+    system_msg = SystemMessage(content="""你是严格的天软财务审批Agent。
+    1. 必须调用工具算账和查制度。
+    2. 如果合规，输出中必须包含“审批通过”四个字。
+    3. 如果违规，输出中说明原因并包含“不予报销”四个字。""")
     
-    messages = [("system", SYSTEM_PROMPT)] + history + [("user", query)]
+    result = await approval_executor.ainvoke({"messages": [system_msg] + state["messages"]})
+    last_message = result["messages"][-1].content
     
-    full_reply = ""
+    # 决定下一步动作
+    next_action = "payment" if "审批通过" in last_message and "不予报销" not in last_message else "end"
+    return {"messages": [AIMessage(content=last_message)], "next_action": next_action}
+
+async def payment_node(state: AgentState):
+    """打款节点：负责生成打款单"""
+    pay_id = f"PAY-{uuid.uuid4().hex[:6].upper()}"
+    payment_res = f"\n\n💸 **[财务打款 Agent 接管]**\n审批已通过，正在处理打款流程。\n打款单号：{pay_id}\n预计 1 个工作日内到账。"
+    return {"messages": [AIMessage(content=payment_res)], "next_action": "end"}
+
+# ================= 3. 组装状态图 =================
+workflow = StateGraph(AgentState)
+
+# 添加节点
+workflow.add_node("approval", approval_node)
+workflow.add_node("payment", payment_node)
+
+# 设置入口
+workflow.set_entry_point("approval")
+
+# 设置条件路由边
+def route_decision(state: AgentState):
+    if state["next_action"] == "payment":
+        return "payment"
+    return END
+
+workflow.add_conditional_edges("approval", route_decision, {"payment": "payment", END: END})
+workflow.add_edge("payment", END)
+
+# 编译图
+multi_agent_graph = workflow.compile()
+
+# ================= 4. 对外暴露的流式接口 =================
+async def run_agent_stream(query: str, history: list):
+    # 将历史记录转为 LangChain 消息格式
+    langchain_history = []
+    for role, content in history:
+        if role == "user":
+            langchain_history.append(HumanMessage(content=content))
+        elif role == "assistant":
+            langchain_history.append(AIMessage(content=content))
+            
+    langchain_history.append(HumanMessage(content=query))
     
-    async for event in approval_agent.astream_events({"messages": messages}, version="v2"):
-        kind = event["event"]
-        if kind == "on_chat_model_stream":
+    # 使用 astream_events 精细控制流
+    async for event in multi_agent_graph.astream_events({"messages": langchain_history, "next_action": ""}, version="v2"):
+        if event["event"] == "on_chat_model_stream":
             content = event["data"]["chunk"].content
             if content and "Thought:" not in content and "Action:" not in content:
-                full_reply += content
                 yield f"data: {content}\n\n"
-                
-    # 只要包含“审批通过”，立刻触发打款
-    if "审批通过" in full_reply:
-        pay_id = f"PAY-{uuid.uuid4().hex[:6].upper()}"
-        
-        # 【核心修复】：彻底干掉所有换行符，确保前端 100% 能接收到！
-        payment_text = f"💸 [系统财务中心接管] 审批已通过，正在处理打款流程。打款单号：{pay_id}，预计 1 个工作日内到账。"
-        
-        # 打印日志，让你在终端里能亲眼看到它触发了
-        print(f"\n======> 成功触发打款！单号：{pay_id}\n")
-        
-        yield f"data: {payment_text}\n\n"
