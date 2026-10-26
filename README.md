@@ -209,6 +209,5 @@ docker run -p 3000:80 tianruan-frontend
 
 ## 版本记录
 
+- v2.1（当前版本）：新增 SQLite 会话持久化与 Docker 镜像；补全流式异常提示；拆分审核 Agent 与打款 Agent，新增打款意图判定；修复打款内容被 SSE 分隔符截断的问题
 - v2.0：前端重构为 React + Ant Design + Vite，接入 ChromaDB 真 RAG 与 LangGraph 多智能体，优化 SSE 流式输出
-- v2.1：新增 SQLite 会话持久化与 Docker 镜像；补全流式异常提示
-- v2.2：拆分审核 Agent 与打款 Agent，新增打款意图判定，修复打款内容被 SSE 分隔符截断的问题
