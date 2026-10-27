@@ -1,0 +1,31 @@
+# 环境变量与密钥
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 数据库与向量库
+*.db
+agent.db
+chroma_db/
+
+# 前端
+node_modules/
+dist/
+dist-ssr/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
