@@ -1,55 +1,73 @@
-import re
 import os
+from datetime import datetime
+
 from langchain_core.tools import tool
-from langchain_community.document_loaders import TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_chroma import Chroma
-from langchain_openai import OpenAIEmbeddings
+from langchain_community.tools.tavily_search import TavilySearchResults
 from dotenv import load_dotenv
+
+import rag
 
 load_dotenv()
 
-# 初始化 ChromaDB
-def get_vectorstore():
-    # 如果没有，用智谱的 Embedding (需要你在 .env 里加 ZHIPU_API_KEY)
-    # 如果你没有智谱Key，这里会报错。请在 bigmodel.cn 注册一个免费拿Key
-    embeddings = OpenAIEmbeddings(
-        model="embedding-2",
-        api_key=os.getenv("ZHIPU_API_KEY"),
-        base_url="https://open.bigmodel.cn/api/paas/v4/"
-    )
-    
-    persist_dir = "./chroma_db"
-    # 如果本地已经有数据库了，直接加载
-    if os.path.exists(persist_dir):
-        return Chroma(persist_directory=persist_dir, embedding_function=embeddings)
-    
-    # 如果没有，读取文件并建库
-    loader = TextLoader("policy.txt", encoding="utf-8")
-    docs = loader.load()
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)
-    splits = text_splitter.split_documents(docs)
-    
-    vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings, persist_directory=persist_dir)
-    return vectorstore
+# 初始化 Tavily 搜索工具
+os.environ["TAVILY_API_KEY"] = os.getenv("TAVILY_API_KEY", "")
+try:
+    tavily_tool = TavilySearchResults(max_results=2)
+except Exception as e:
+    print(f"Tavily 初始化失败: {e}")
+    tavily_tool = None
 
-vectorstore = get_vectorstore()
-retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
 
-@tool
-def calculator(expression: str) -> str:
-    """用于计算金额总和。输入必须是纯数字表达式，如 '550+800'。"""
-    try:
-        clean_expr = re.sub(r'[^0-9+\-*/().]', '', expression)
-        return f"计算结果：{eval(clean_expr, {'__builtins__': None}, {})} 元"
-    except Exception as e:
-        return f"计算失败：{str(e)}"
+# ================= 工具定义区 =================
 
 @tool
 def search_policy(query: str) -> str:
-    """从向量数据库中查询公司差旅制度。输入你要查询的类别，如：'住宿标准'、'打车限制'。"""
-    # 真正的 RAG 检索！只返回最相关的 2 个文档片段
-    docs = retriever.invoke(query)
-    if not docs:
-        return "未找到相关制度。"
-    return "\n---\n".join([d.page_content for d in docs])
+    """检索天软公司差旅报销制度。query 传入要查询的问题或关键词，
+    例如“北京住宿标准”“打车限额”“出差补助规则”“火车票降级”。返回最相关的条款片段。"""
+    return rag.search(query, k=4)
+
+
+@tool
+def calculate_allowance(depart_time_str: str, return_time_str: str) -> str:
+    """计算差旅补助。输入格式 'YYYY-MM-DD HH:MM'。
+    规则：每天 150 元，中午 12 点为界，12 点后出发算半天，12 点前返回算半天。"""
+    try:
+        fmt = "%Y-%m-%d %H:%M"
+        depart = datetime.strptime(depart_time_str, fmt)
+        ret = datetime.strptime(return_time_str, fmt)
+        if ret < depart:
+            return "时间顺序错误：返程时间早于出发时间，请核对。"
+        days = (ret.date() - depart.date()).days + 1
+        if depart.hour >= 12:
+            days -= 0.5
+        if ret.hour <= 12:
+            days -= 0.5
+        days = max(days, 0.5)
+        amount = days * 150
+        return f"计算成功：共折合 {days} 天，差旅补助总计 {amount} 元。"
+    except Exception as e:
+        return f"时间格式错误：{e}"
+
+
+@tool
+def train_downgrade(seat_class: str, actual_price: float, second_class_price: float) -> str:
+    """火车票降级报销计算。一等座降级为二等座报销。"""
+    if seat_class == "二等座":
+        return f"实报实销 {actual_price} 元。"
+    allowed = min(actual_price, second_class_price)
+    return f"降级报销：实际报销 {allowed} 元，个人自理 {actual_price - allowed} 元。"
+
+
+@tool
+def search_train_info(depart_city: str, arrive_city: str, train_no: str) -> str:
+    """联网搜索车次发车时间和二等座票价。"""
+    if not tavily_tool:
+        return "搜索工具未配置，请手动输入发车时间和票价。"
+    query = f"12306 火车 {train_no} 从{depart_city}到{arrive_city} 时刻表 二等座票价"
+    try:
+        results = tavily_tool.invoke(query)
+        if not results:
+            return f"未搜索到 {train_no} 的信息。"
+        return "\n".join([f"内容:{r.get('content')}" for r in results])
+    except Exception as e:
+        return f"搜索失败：{e}"

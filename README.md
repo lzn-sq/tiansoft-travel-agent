@@ -1,146 +1,159 @@
 # 天软差旅合规多智能体系统
 
-基于 FastAPI + LangGraph + RAG 的企业差旅报销审核 Demo：用户在前端对话式提交报销需求，系统先由**审核 Agent** 依据公司制度与金额做合规判定，只在"审核通过且用户明确要求报销/打款"时，才交由**打款 Agent** 生成打款单，全程 SSE 流式输出。
+基于 FastAPI + React + LangGraph + ChromaDB + DeepSeek 的差旅报销审核 Demo。用户用自然语言描述行程与费用，系统依次完成**信息抽取 → 必填校验 → 审核 Agent 核算 → 打款 Agent 出单**，全程 SSE 流式输出；缺失信息自动追问，核算合规后生成 `PAY-XXXXXX` 打款单。
 
 ## 功能概览
 
-- 对话式差旅费合规审核（住宿、交通、餐饮、补贴等）
-- 基于公司制度的 RAG 检索，结论有据可依，降低模型幻觉
-- 审核 Agent 与打款 Agent 职责分离，避免"只是咨询是否合规"也触发打款
-- 打款单号自动生成（`PAY-XXXXXX`），审批不通过不会打款
-- 流式回答、Markdown 渲染、多轮会话持久化
-- 前后端独立 Docker 镜像
+- 用户名密码登录（bcrypt 存储密码）+ JWT 鉴权，会话按用户隔离
+- 对话式差旅费核算（交通、住宿、打车、补助）
+- 结构化信息抽取：城市、职级、住宿总额/晚数、打车费、车次、发车时间、返程时间
+- 必填项校验，缺字段直接追问，不进入核算
+- 审核 Agent 工具核算：制度语义检索、差旅补助、火车票降级、联网查车次
+- 制度知识库 RAG：ChromaDB + 智谱 `embedding-2`，不可用时自动降级为关键词检索
+- LangGraph 状态图编排，审核通过后需用户明确回复“确认打款”才进入打款节点
+- 会话列表 / 切换 / 删除，历史消息自动裁剪后送入模型
+- 登录与对话接口限流、CORS 白名单、401 自动跳转登录
+- 流式输出可手动停止（AbortController），刷新后历史消息还原
+- 后端 pytest 测试 + GitHub Actions CI
+- 前后端独立 Docker 镜像，SQLite 与向量库数据卷持久化
 
 ## 系统架构
 
 ```
-React SPA (Vite)
-   |  POST /api/chat/stream  (SSE)
+React SPA (Vite + Ant Design)
+   |  JWT Bearer  /api/chat/stream (SSE, JSON 帧)
    v
 FastAPI (async, Uvicorn)
-   |  会话历史读写 (SQLAlchemy async + SQLite)
+   |-- 鉴权 / 限流 / CORS 白名单
+   |-- 会话与消息 CRUD（SQLAlchemy async + SQLite）
    v
-LangGraph 编排
-   |-- 审核 Agent (ReAct: DeepSeek + 工具)
-   |      |-- calculator      金额计算
-   |      `-- search_policy   ChromaDB 制度检索
-   `-- 打款 Agent (确定性节点，生成打款单)
+LangGraph StateGraph
+   |-- extract    DeepSeek 抽取报销表单 JSON
+   |-- validate   校验必填项，缺失则进入 ask_more 结束
+   |-- audit      审核 Agent（ReAct + 工具）逐项核算
+   |-- confirm    核算合规但用户未要求打款时，仅提示确认
+   `-- payment    用户明确要求打款时生成打款单 PAY-XXXXXX
+          |
+          `-- 工具：search_policy / calculate_allowance
+                   train_downgrade / search_train_info
+                        |
+                        `-- ChromaDB 制度向量库（智谱 embedding-2）
+                            失败 -> 关键词检索降级
 ```
 
 一次请求的流程：
 
-1. 前端挂载时调用 `GET /api/session` 获取 `session_id`
-2. 发送消息到 `POST /api/chat/stream`
-3. 后端读取该会话历史，保存用户消息
-4. 审核 Agent 流式推理并调用工具，输出审核结论
-5. 若结论为"审批通过"（且不含"不予报销"），并且意图判定为"要求报销/打款"，则调用打款 Agent
-6. 流结束后把完整回复写入 `messages` 表
+1. 前端登录后进入主界面，拉取会话列表并加载当前会话历史
+2. 发送消息到 `POST /api/chat/stream`（携带 JWT）
+3. 后端校验会话归属与限流，读取裁剪后的历史，保存用户消息
+4. 状态图依次执行抽取、校验；字段齐全进入审核 Agent，否则返回追问清单
+5. 审核结果含“总计报销”时：若用户明确表达打款意愿（如“确认打款”）则流转到打款节点；否则只提示金额待确认，不生成打款单
+6. 结果逐字以 SSE 推送；结束后把完整回复与 `PAY-` 单号落库
 
 ## 技术栈
 
 | 层次 | 技术 | 说明 |
 | --- | --- | --- |
 | 后端框架 | FastAPI、Uvicorn | 异步接口、`StreamingResponse` 输出 SSE |
-| 多智能体编排 | LangGraph `StateGraph` | 审核与打款分别编译为独立图 |
-| Agent 实现 | LangChain `create_react_agent` | 审核 Agent 的工具调用循环 |
+| 编排方式 | LangGraph `StateGraph` | 抽取 → 校验 → 审核 → 打款的条件分支 |
+| Agent 实现 | LangGraph `create_react_agent` | 审核阶段的工具调用循环 |
 | 模型接入 | `langchain_openai.ChatOpenAI` | OpenAI 兼容协议访问 DeepSeek |
-| 向量检索 | ChromaDB、`langchain_chroma` | 本地持久化向量库 `chroma_db/` |
-| 文档处理 | `TextLoader`、`RecursiveCharacterTextSplitter` | 制度文档切片（200 字，重叠 20） |
-| 数据持久化 | SQLAlchemy 2.0 async、aiosqlite | `sessions`、`messages` |
-| 配置管理 | python-dotenv | 从 `.env` 读取密钥 |
+| 向量检索 | ChromaDB、智谱 `embedding-2` | 制度片段向量化与语义检索 |
+| 联网搜索 | Tavily（`langchain_community`） | 查询车次时刻与票价 |
+| 数据持久化 | SQLAlchemy 2.0 async、aiosqlite | `users`、`sessions`、`messages`、`payment_records` |
+| 鉴权 | bcrypt + 自实现 HS256 JWT | 无额外 JWT 依赖，密钥来自环境变量 |
 | 前端 | React 19、Vite 8 | 单页应用与开发服务器 |
-| UI 组件 | Ant Design 6、@ant-design/icons | 侧边栏布局、输入框、加载态 |
-| 前端路由 | react-router-dom 7 | "智能审查""系统架构"两个页面 |
+| UI 组件 | Ant Design 6、@ant-design/icons | 登录页、侧边会话列表、聊天界面 |
+| 前端路由 | react-router-dom 7 | 登录页 / 智能审查 / 系统架构 |
 | Markdown | react-markdown 10、remark-gfm | 渲染加粗、表格、列表 |
-| 部署 | Docker 多阶段构建、Nginx | 后端 `python:3.12-slim`，前端 `node:20-alpine` + `nginx:alpine` |
+| 测试与 CI | pytest、GitHub Actions | `backend/tests`，推送自动运行 |
+| 部署 | Docker 多阶段构建、Nginx | 前端 Nginx 反向代理 `/api`，SSE 不缓冲 |
 
-## 使用的大模型
+## 模型与外部服务
 
-| 模型 | 供应商 | 调用地址 | 用途 | 环境变量 |
-| --- | --- | --- | --- | --- |
-| `deepseek-chat` | DeepSeek | `https://api.deepseek.com/v1` | 审核推理、工具调用、生成结论、打款意图判定（`temperature=0`） | `DEEPSEEK_API_KEY` |
-| `embedding-2` | 智谱 AI | `https://open.bigmodel.cn/api/paas/v4/` | 制度文本向量化与检索，不生成文本 | `ZHIPU_API_KEY` |
+| 名称 | 供应商 | 用途 | 环境变量 |
+| --- | --- | --- | --- |
+| `deepseek-chat` | DeepSeek | 信息抽取、工具调用、费用核算（`temperature=0`） | `DEEPSEEK_API_KEY` |
+| `embedding-2` | 智谱 AI | 制度片段与查询向量化 | `ZHIPU_API_KEY` |
+| Tavily Search | Tavily | 查询车次时刻表与二等座票价 | `TAVILY_API_KEY` |
 
-两个 Key 缺一不可：检索器在导入 `tools.py` 时就初始化，智谱 Key 失效会导致服务无法启动；DeepSeek Key 失效则审核阶段直接报错（前端会显示异常信息）。
+- `DEEPSEEK_API_KEY` 缺失会导致抽取与核算失败
+- `ZHIPU_API_KEY` 缺失或不可用时，RAG 自动降级为关键词检索，不影响主流程
+- `TAVILY_API_KEY` 缺失时 `search_train_info` 返回提示，其余流程正常
 
-## 多智能体设计
+## 工具说明
 
-### 审核 Agent
+| 工具 | 入参 | 说明 |
+| --- | --- | --- |
+| `search_policy` | `query` | 在制度向量库中检索最相关的 4 个条款片段 |
+| `calculate_allowance` | `depart_time_str`、`return_time_str` | 每天 150 元，12 点为界，去程下午算半天、返程上午算半天 |
+| `train_downgrade` | `seat_class`、`actual_price`、`second_class_price` | 一等座按二等座价格报销，差价自理 |
+| `search_train_info` | `depart_city`、`arrive_city`、`train_no` | Tavily 联网搜索车次信息 |
 
-- 节点：`approval_node`
-- 提示词要求必须调用工具算账与查制度，合规输出"审批通过"，违规输出"不予报销"并说明原因
-- 工具：
-  - `calculator`：清洗表达式后计算金额，如 `550+800`
-  - `search_policy`：从 ChromaDB 检索最相关的 2 条制度条款
-- 由单节点图 `review_agent` 承载，只做审核，不涉及打款
+## 鉴权与稳定性
 
-### 打款 Agent
-
-- 节点：`payment_node`
-- 不调用大模型，直接生成打款文案与 `PAY-` 开头的单号（UUID 前 6 位大写）
-- 由独立图 `payment_agent` 承载
-
-### 调度逻辑
-
-`run_agent_stream` 负责串联：
-
-1. 先流式运行审核图
-2. 根据审核文本判断是否通过
-3. 调用 `wants_payment` 判断用户意图：咨询标准、询问是否合规、问"能否报销"都判为 `REVIEW`；只有"帮我报销""发起打款""提交报销"等才判为 `PAY`；判定异常时默认 `REVIEW`
-4. 仅当"通过 + PAY"时运行打款图
-
-### 流式输出要点
-
-- 使用 `astream_events(version="v2")` 监听 `on_chat_model_stream`，过滤 `Thought:`、`Action:` 等中间步骤
-- 打款节点不产生模型分片，改为监听 `on_chain_end` 且节点名为 `payment`
-- 推送前对内容做 `strip()`：内容中的 `\n\n` 是 SSE 事件分隔符，不处理会被前端截断
-
-## RAG 知识库
-
-- 语料：`policy.txt`，包含城市等级、住宿标准、交通标准、餐饮补贴、违规红线五章
-- 首次运行时自动切片并向量化，持久化到 `./chroma_db`；之后直接加载
-- 检索参数：`k=2`，召回片段拼接后交给审核 Agent
-- 修改制度后需删除 `chroma_db/` 重新建库
+- 密码使用 bcrypt 哈希存储，JWT 有效期默认 1440 分钟
+- 登录/注册按 IP 限流（默认 10 次/分钟），对话按用户限流（默认 20 次/分钟）
+- CORS 仅允许配置中的来源（默认 `localhost:5173`）
+- 会话、消息、删除接口均校验 `session_id` 与当前用户归属，越权返回 404
+- 历史消息默认只取最近 12 条、总字符不超过 6000，单条超长内容截断
+- SSE 事件统一为 `data: {"text": "..."}\n\n`；整体超时 180 秒
+- 前端 401 自动清理凭证并跳转登录；支持停止生成，切换会话会中止当前请求
+- RAG 构建/查询失败自动降级，5 分钟后重试；启动时后台预热向量库
 
 ## 接口说明
 
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `GET` | `/api/session` | 创建 UUID 会话并写库，返回 `session_id` |
-| `POST` | `/api/chat/stream` | 入参 `{session_id, text}`，返回 `text/event-stream` |
+| 方法 | 路径 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| `POST` | `/api/auth/register` | 否 | 注册并返回 JWT |
+| `POST` | `/api/auth/login` | 否 | 登录并返回 JWT |
+| `GET` | `/api/auth/me` | 是 | 当前用户信息 |
+| `POST` | `/api/session` | 是 | 新建会话，返回 `session_id` |
+| `GET` | `/api/sessions` | 是 | 当前用户会话列表 |
+| `GET` | `/api/sessions/{id}/messages` | 是 | 会话历史消息 |
+| `DELETE` | `/api/sessions/{id}` | 是 | 删除会话及其消息、打款记录 |
+| `POST` | `/api/chat/stream` | 是 | `{session_id, text}`，返回 `text/event-stream` |
 
-SSE 每条消息格式为 `data: {内容}\n\n`。后端异常会以 `data: 后端处理异常：...` 返回，避免前端无限等待。
+接口文档：`http://127.0.0.1:8000/docs`。
 
 ## 数据模型
 
-- `sessions`：会话 ID（UUID）、标题、创建时间
+- `users`：用户名（唯一）、bcrypt 密码哈希、创建时间
+- `sessions`：会话 ID（UUID）、所属用户、标题、创建/更新时间
 - `messages`：自增 ID、所属会话、角色（`user`/`assistant`）、内容、时间
-- 删除会话时级联删除消息
-- 数据库文件 `agent.db` 位于 `backend` 目录，已加入 `.gitignore`
+- `payment_records`：打款单号（`PAY-` 开头，唯一）、所属会话、状态、时间
+- 删除会话时同步删除消息与打款记录
+- 默认数据库文件 `backend/agent.db`，Docker 中位于 `/app/data/agent.db`
 
 ## 目录结构
 
 ```
 Tiansoft-Agent-Project/
-├── backend/                 # FastAPI 后端
-│   ├── agent_core.py        # 模型初始化、多 Agent 编排、SSE 流式接口
-│   ├── main.py              # FastAPI 应用、会话与聊天接口、启动建表
-│   ├── tools.py             # calculator / search_policy 工具，ChromaDB 初始化
-│   ├── database.py          # 异步引擎、SessionLocal、Base、get_db
-│   ├── models.py            # Session / Message 模型
-│   ├── crud.py              # 会话与消息的异步 CRUD
+├── backend/
+│   ├── main.py              # 应用入口、鉴权/会话/聊天接口
+│   ├── agent_core.py        # LangGraph 状态图、节点、SSE 流式输出
+│   ├── tools.py             # 制度检索、补助、降级、车次搜索工具
+│   ├── rag.py               # ChromaDB 向量库 + 关键词降级
+│   ├── auth.py              # bcrypt 密码、HS256 JWT、当前用户依赖
+│   ├── rate_limit.py        # 内存滑动窗口限流
+│   ├── database.py          # 异步引擎、会话工厂、Base
+│   ├── models.py            # User / Session / Message / PaymentRecord
+│   ├── crud.py              # 异步 CRUD 与历史裁剪
 │   ├── policy.txt           # 差旅报销制度语料
-│   ├── requirements.txt     # Python 依赖
-│   ├── Dockerfile           # 后端镜像
-│   └── agent.db             # SQLite 数据文件（本地生成，不纳入版本管理）
-├── frontend/                # React 前端
-│   ├── src/App.jsx          # 布局与侧边导航
-│   ├── src/pages/Chat.jsx   # 聊天页与 SSE 解析
+│   ├── tests/               # pytest 用例
+│   ├── requirements.txt
+│   └── Dockerfile
+├── frontend/
+│   ├── src/api.js           # API 基址、JWT 注入、401 处理
+│   ├── src/App.jsx          # 布局、会话列表、登录守卫
+│   ├── src/pages/Login.jsx  # 登录/注册页
+│   ├── src/pages/Chat.jsx   # 聊天页、SSE 解析、停止生成
 │   ├── src/pages/About.jsx  # 架构说明页
-│   ├── Dockerfile           # 前端多阶段构建 + Nginx
-│   └── package.json
-├── docker-compose.yml       # 前后端一键编排
-└── .gitignore
+│   ├── nginx.conf           # SPA 回退 + /api 反向代理（SSE 不缓冲）
+│   └── Dockerfile
+├── .github/workflows/backend-tests.yml
+├── docker-compose.yml
+└── README.md
 ```
 
 ## 快速开始
@@ -152,17 +165,28 @@ Tiansoft-Agent-Project/
 ```env
 DEEPSEEK_API_KEY=your_deepseek_key
 ZHIPU_API_KEY=your_zhipu_key
+TAVILY_API_KEY=your_tavily_key
+
+JWT_SECRET=please-change-me
+TOKEN_TTL_MINUTES=1440
+CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173,http://localhost
+
+CHAT_RATE_LIMIT=20
+AUTH_RATE_LIMIT=10
+HISTORY_LIMIT=12
+HISTORY_MAX_CHARS=6000
+EMBED_MODEL=embedding-2
 ```
+
+可选：`DATABASE_URL`（默认 `sqlite+aiosqlite:///./agent.db`）、`CHROMA_DIR`（默认 `backend/chroma_db`）、`RAG_WARMUP=0` 关闭启动预热。
 
 ### 2. 启动后端
 
 ```powershell
 cd d:\Tiansoft-Agent-Project\backend
 pip install -r requirements.txt
-python -m uvicorn main:app --reload --port 8000
+python -m uvicorn main:app --host 127.0.0.1 --port 8000
 ```
-
-首次启动会加载/构建 `chroma_db`，需要数秒；接口文档见 `http://127.0.0.1:8000/docs`。
 
 ### 3. 启动前端
 
@@ -172,46 +196,48 @@ npm install
 npm run dev
 ```
 
-访问 `http://localhost:5173`。前端请求地址固定为 `http://127.0.0.1:8000`。
+访问 `http://localhost:5173`，首次使用在登录页切到“注册”创建账号。
+前端默认请求 `http://127.0.0.1:8000`，可用 `VITE_API_BASE_URL` 覆盖；设置为空字符串时走同源（供 Docker/Nginx 代理）。
 
-### 4. Docker（可选）
+### 4. 测试
 
 ```powershell
-# 在项目根目录一键启动前后端
-cd d:\Tiansoft-Agent-Project
-docker compose up -d --build
-
-# 或分别构建
-docker build -t tianruan-agent ./backend
-docker run --env-file ./backend/.env -p 8000:8000 tianruan-agent
-
-docker build -t tianruan-frontend ./frontend
-docker run -p 3000:80 tianruan-frontend
+cd d:\Tiansoft-Agent-Project\backend
+python -m pytest -q
 ```
 
-说明：`docker-compose.yml` 使用 `./backend` 与 `./frontend` 作为构建上下文，密钥通过 `backend/.env` 注入；容器重建后 `agent.db` 数据会丢失，需要持久化时自行挂载卷。
+测试使用独立 `test_agent.db`，不调用外部模型；CI 配置见 `.github/workflows/backend-tests.yml`。
+
+### 5. Docker（可选）
+
+```powershell
+cd d:\Tiansoft-Agent-Project
+docker compose up -d --build
+```
+
+访问 `http://localhost`。`backend` 使用具名卷 `backend_data`（SQLite）与 `chroma_data`（向量库）持久化；前端 Nginx 将 `/api` 反向代理到后端。
 
 ## 示例
 
 | 输入 | 预期行为 |
 | --- | --- |
-| 帮我审核一下，普通员工一线城市住宿 1 晚 500 元是否合规？ | 只输出审核结论，不出现打款信息 |
-| 住宿标准是多少？ | 返回制度条款，不打款 |
-| 普通员工一线城市住宿 1 晚 2000 元，帮我报销 | 说明超标部分自理、不予报销，不打款 |
-| 普通员工一线城市住宿 1 晚 500 元，帮我报销 | 审核通过后输出 `PAY-` 打款单 |
+| 我29日坐C2202去北京，住宿两晚630元，打车75元，帮我算算 | 缺少“职级”，返回追问文案，不核算、不打款 |
+| 我是普通员工，10月29日08:00坐C2202一等座去北京，住宿两晚630元，打车75元，10月30日14:00返程 | 输出费用明细与总计报销，提示“尚未打款”，不生成打款单 |
+| 接着回复“确认打款” | 重新核算并生成 `PAY-` 打款单 |
+| 住宿标准是多少？ | 缺少必填信息，返回追问清单 |
 
-## 已知限制与改进方向
+## 已知限制
 
-1. 无鉴权与限流，CORS 为 `*`，仅适合内网演示
-2. `get_history` 返回全部历史，长会话会增大 token 消耗（注释中的"最近 10 轮"未实现）
-3. 打款为模拟流程，未对接支付系统，无审批流、幂等与台账
-4. `wants_payment` 额外调用一次大模型，增加约 1 秒首字延迟
-5. SSE 解析较简化：模型分片若含 `\n\n` 会丢失空行，规范做法是按 SSE 多行 `data:` 编码
-6. 前端后端地址硬编码，建议改为环境变量或 Nginx 反向代理
-7. 检索粒度较粗（200 字切片、`k=2`），制度更新需重建向量库
-8. 缺少自动化测试与 CI
+1. 打款为模拟流程，未对接真实支付系统，无审批流与台账（按要求不实现）
+2. 未提供线上部署与域名/HTTPS 配置（按要求不实现）
+3. 限流为单进程内存实现，多副本部署需改用 Redis
+4. 逐字推送会产生较多细小 SSE 事件，不支持断点续传
+5. 信息抽取依赖大模型，仍可能漏抽字段
 
 ## 版本记录
 
-- v2.1（当前版本）：新增 SQLite 会话持久化与 Docker 镜像；补全流式异常提示；拆分审核 Agent 与打款 Agent，新增打款意图判定；修复打款内容被 SSE 分隔符截断的问题
-- v2.0：前端重构为 React + Ant Design + Vite，接入 ChromaDB 真 RAG 与 LangGraph 多智能体，优化 SSE 流式输出
+- v4.1：打款改为显式授权——核算完成后只提示金额，用户回复“确认打款”等明确指令才生成打款单，避免擅自打款
+- v4.0（当前版本）：新增 JWT 鉴权与限流、ChromaDB RAG、LangGraph 审核/打款状态图、会话管理与历史裁剪、前端登录页与会话列表、停止生成、Docker 数据持久化、pytest 与 CI
+- v3.0：修复 SSE 帧缺少结束符导致的回复卡住问题，改为 JSON 编码事件；超时放宽至 180 秒
+- v2.1：新增 SQLite 会话持久化与 Docker 镜像；补全流式异常提示
+- v2.0：前端重构为 React + Ant Design + Vite，接入工具调用与流式输出
