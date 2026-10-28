@@ -56,7 +56,6 @@ REQUIRED_FIELDS = {
     "job_level": "职级",
     "hotel_amount": "住宿总额",
     "hotel_nights": "住宿晚数",
-    "train_no": "车次号",
     "depart_time": "发车时间",
 }
 
@@ -89,7 +88,9 @@ async def extract_node(state: AgentState) -> dict:
   "depart_time": "发车时间(YYYY-MM-DD HH:MM)",
   "return_time": "返程时间(YYYY-MM-DD HH:MM)"
 }}
-未提及的字段填 null。以本轮用户最新消息为准；本轮未提及但历史中已明确的信息可以沿用。"""
+未提及的字段填 null。以本轮用户最新消息为准；本轮未提及但历史中已明确的信息可以沿用。
+若用户给出返程时间但没给日期（如“回来的时候下午三点”），结合“出差 N 天”或出发日期推算返程日期，
+补全为 YYYY-MM-DD HH:MM；无法确定时填 null。"""
     try:
         response = await model.ainvoke([SystemMessage(content=prompt)] + state.get("messages", []))
         content = response.content

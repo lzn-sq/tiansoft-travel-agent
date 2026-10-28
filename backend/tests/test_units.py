@@ -1,5 +1,5 @@
 import rag
-from agent_core import _last_approved_total, _wants_payment
+from agent_core import REQUIRED_FIELDS, _last_approved_total, _wants_payment, validate_node
 from auth import create_access_token, decode_access_token
 from tools import calculate_allowance
 
@@ -65,3 +65,21 @@ def test_last_approved_total():
     assert _last_approved_total(history) == "1347.5"
     assert _last_approved_total([("assistant", "请补充职级")]) is None
     assert _last_approved_total([]) is None
+
+
+def test_train_no_is_optional():
+    assert "train_no" not in REQUIRED_FIELDS
+    # 车次号缺失但时间、金额齐全时不应追问
+    form = {
+        "city": "上海",
+        "job_level": "普通员工",
+        "hotel_amount": 700,
+        "hotel_nights": 2,
+        "train_no": None,
+        "depart_time": "2026-10-29 09:00",
+    }
+    assert validate_node({"form": form})["missing"] == []
+
+    # 核心字段仍必须校验
+    missing = validate_node({"form": {**form, "city": None}})["missing"]
+    assert missing == ["出差目的地"]
